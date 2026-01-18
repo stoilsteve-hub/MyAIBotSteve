@@ -18,6 +18,65 @@ The bot now dynamically detects the **Quote Asset** (e.g., EUR, USDT, BTC) based
     *   Daily Trade Count exceeds `MAX_TRADES_PER_DAY`.
     *   API Errors exceed `ERROR_LIMIT`.
 
+## Bot Capabilities
+
+### What the bot IS right now
+
+1. **Real-money trading bot (Spot only)**
+   - Trades real ETH ↔ EUR on Binance Spot
+   - Uses a small, isolated pot (~10 EUR) so it cannot drain your account
+   - No leverage, no margin, no borrowing
+
+2. **Self-protecting at startup**
+   - Before doing anything risky, it:
+     - Verifies API keys
+     - Verifies Spot permissions
+     - Places and cancels a real order to confirm Binance truly allows trading this pair
+     - Refuses to run if this test fails
+   - 👉 This prevents silent failures and “money-burning loops”.
+
+3. **Trend-aware (not dumb dip buying)**
+   - Collects live prices every loop
+   - Builds a Simple Moving Average (SMA)
+   - Will NOT buy unless price is above the SMA
+   - This avoids buying during downtrends or falling knives
+
+4. **Uses LIMIT orders (not MARKET)**
+   - Buys slightly below market price
+   - Sells slightly above market price
+   - Reduces slippage and bad fills
+   - Cancels orders automatically if not filled within a timeout
+
+5. **Handles partial fills correctly**
+   - If only part of an order fills:
+     - It updates balances accurately
+     - Does NOT flip state unless the fill is meaningful
+     - Avoids dust trades and broken state
+
+6. **Hard safety limits**
+   - The bot will STOP if:
+     - Daily loss exceeds your limit
+     - Too many trades happen in one day
+     - Too many API errors occur
+     - Binance rejects orders unexpectedly
+
+7. **State survives restarts**
+   - It remembers:
+     - Whether it’s holding ETH or EUR
+     - Entry price
+     - Trend history
+     - Daily counters
+   - You can safely restart without confusing it.
+
+### What the bot will NOT do (by design)
+
+- ❌ It will not trade multiple coins
+- ❌ It will not chase pumps
+- ❌ It will not scalp rapidly
+- ❌ It will not trade during uncertainty
+- ❌ It will not ignore safety rules
+- ❌ It will not “print money fast”
+
 ## Key Features
 - **Pot System**: Isolates funds. Starts with ~10 EUR/USDT (configurable).
 - **Safety First**:
