@@ -1,0 +1,13 @@
+# Environment Variables (Secrets)
+.env
+
+# Dependencies
+venv/
+__pycache__/
+
+# Logs & State
+*.log
+bot_state.json
+
+# OS Specific
+.DS_Store
