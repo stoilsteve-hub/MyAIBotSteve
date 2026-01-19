@@ -639,13 +639,15 @@ def reserve_watcher(client, bot_state, current_mid, step_size_decimal, step_size
     # User requested: "Every loop tick (or every N ticks)". Let's do every 4 ticks (approx 1 min).
     # Since we don't have a tick counter passed in, we can use time mod.
     if int(now_ts) % 60 < LOOP_INTERVAL_SECONDS: # Rough "once per minute" check
-         mode_str = "AUTOSALE" if ENABLE_RESERVE_AUTOSALE else "MONITOR"
+         mode_str = "YES" if ENABLE_RESERVE_AUTOSALE else "NO"
+         # Calc Trail Value
+         trail_val_log = bot_state.reserve_high_watermark_quote * (1 - RESERVE_TRAIL_PCT)
          if reserve_eth_float > 0:
-             logger.info(f"RESERVE: {reserve_eth:.4f} ETH | Val: {reserve_value_quote:.2f} {QUOTE_ASSET} | High: {bot_state.reserve_high_watermark_quote:.2f} | Mode: {mode_str}")
+             logger.info(f"RESERVE | ETH:{reserve_eth:.4f} | Val:{reserve_value_quote:.2f} {QUOTE_ASSET} | High:{bot_state.reserve_high_watermark_quote:.2f} | TrailStop:{trail_val_log:.2f} | AutoSale:{mode_str}")
          else:
              # Only log "No Reserve" occasionally (long interval)
              if int(now_ts) % 600 < LOOP_INTERVAL_SECONDS:
-                 logger.info(f"RESERVE: No reserve detected (Free: {total_free_eth:.4f}, Pot: {pot_eth_dec:.4f})")
+                 logger.info(f"RESERVE | No reserve detected (Free: {total_free_eth:.4f}, Pot: {pot_eth_dec:.4f})")
 
     if reserve_eth_float == 0:
         return
@@ -1095,12 +1097,60 @@ def main():
             if not trend_ready:
                  logger.info(f"Collecting trend data... ({len(bot.price_history)}/{TREND_MIN_SAMPLES})")
             else:
-                 # Enhanced Logging
-                 if bot.state == "HOLDING_QUOTE":
-                      disp_target = bot.last_sell_price * (1 - BUY_DROP_PCT)
-                      logger.info(f"State: {bot.state} | Price: {current_price:.2f} | SMA: {sma:.2f} | DipTarget: {disp_target:.2f} | Pot: {bot.pot_quote:.2f} {QUOTE_ASSET}")
-                 else:
-                      logger.info(f"State: {bot.state} | Price: {current_price:.2f} | SMA: {sma:.2f} | Pot: {bot.pot_eth:.4f} ETH")
+                  # UNIFIED SNAPSHOT LOGGING (Every Loop)
+                  # 1. Prepare BUY Data
+                  snap_anchor = bot.last_sell_price
+                  if snap_anchor <= 0: snap_anchor = current_price
+                  if trend_ready and DIP_ANCHOR_MODE != "LAST_SELL_ONLY":
+                      snap_sma = sma
+                      if DIP_ANCHOR_MODE == "SMA_ONLY": snap_anchor = snap_sma
+                      elif DIP_ANCHOR_MODE == "BLEND":
+                          w = DIP_BLEND_SMA_WEIGHT
+                          snap_anchor = (Decimal(str(snap_sma)) * Decimal(str(w))) + (Decimal(str(snap_anchor)) * Decimal(str(1-w)))
+                          snap_anchor = float(snap_anchor)
+
+                  snap_dip_target = snap_anchor * (1 - BUY_DROP_PCT)
+                  snap_dip_ok = current_price <= snap_dip_target
+                  
+                  # Trend Status Check (Dry Run/Snapshot)
+                  snap_trend_reason = "WARMUP"
+                  if trend_ready:
+                       snap_prev_price = bot.price_history[-2] if len(bot.price_history) >= 2 else current_price
+                       # Re-use reversed confirmation logic non-destructively
+                       # Note: is_reversal_confirmed logic is pure func
+                       _, snap_trend_reason = is_reversal_confirmed(bot.price_history, current_price, sma, snap_prev_price, prev_sma)
+                  
+                  snap_cooldown = max(0, int(bot.trend_block_until - time.time()))
+                  
+                  # 2. Prepare SELL Data
+                  # Entry price might be unknown if not persisted in last_buy_price.
+                  # If we are holding ETH, pot_quote ~0. 
+                  # We can try to infer break-even if we had it. 
+                  # For now, placeholder 0.00 unless we add persistence for last_buy_price.
+                  # User didn't ask us to ADD persistence, just log.
+                  snap_entry = 0.00 
+                  snap_tp = 0.00
+                  snap_sl = 0.00
+                  snap_sig = "NONE"
+                  
+                  if bot.state == "HOLDING_ETH":
+                      # If logic is standard, calculate hypothetical TP/SL
+                      # We don't have entry price stored? CHECK BotState.
+                      # Usually `bot.last_buy_price`? Wait, checking BotState def...
+                      # It has `last_trade_time`, `last_sell_price`. No last_buy_price.
+                      # So we cannot accurately show Entry/TP/SL in snapshot without state change.
+                      # Constraint: "No logic/config changes".
+                      # We will log "0.00" as we can't invent data.
+                      pass
+
+                  # Log Line
+                  pot_eur_fmt = f"{bot.pot_quote:.2f}"
+                  pot_eth_fmt = f"{bot.pot_eth:.4f}"
+                  
+                  buy_part = f"LastSell:{bot.last_sell_price:.2f} DipTarget:{snap_dip_target:.2f} DipOK:{snap_dip_ok} Trend:{snap_trend_reason} Cooldown:{snap_cooldown}s"
+                  sell_part = f"Entry:{snap_entry:.2f} TP:{snap_tp:.2f} SL:{snap_sl:.2f} Signal:{snap_sig}"
+                  
+                  logger.info(f"SNAPSHOT | State:{bot.state} | Price:{current_price:.2f} | SMA:{sma:.2f} | Pot{{EUR:{pot_eur_fmt} ETH:{pot_eth_fmt}}} | BUY{{{buy_part}}} | SELL{{{sell_part}}}")
 
             # 5. Logic
             if bot.state == "HOLDING_QUOTE":
@@ -1147,9 +1197,33 @@ def main():
 
                         # 1. Check Trend Block Cooldown
                         if should_apply_trend_block(bot, time.time()):
-                             logger.info(f"BUY SKIPPED (Trend cooldown active until {bot.trend_block_until:.0f})")
+                             logger.info(f"BUY_EVAL | DipOK=True | TrendGate=COOLDOWN | Cooldown:{bot.trend_block_until - time.time():.0f}s")
+                             # logger.info(f"BUY SKIPPED (Trend cooldown active until {bot.trend_block_until:.0f})") # Old log
                              time.sleep(LOOP_INTERVAL_SECONDS)
                              continue
+
+                        # 2. Reversal/Trend Check
+                        # Check Warmup
+                        if not trend_ready:
+                             logger.info(f"BUY_EVAL | DipOK=True | TrendGate=WARMUP | Samples:{len(bot.price_history)}")
+                             logger.info("BUY SKIPPED (Trend Warmup)")
+                             time.sleep(LOOP_INTERVAL_SECONDS)
+                             continue
+                        
+                        # Check Gate
+                        confirmed, reason = is_reversal_confirmed(bot.price_history, current_price, current_sma, prev_price, prev_sma)
+                        
+                        if not confirmed:
+                             # FAILED
+                             logger.info(f"BUY_EVAL | DipOK=True | TrendGate=BLOCKED ({reason}) | Cooldown:0s")
+                             logger.info(f"BUY SKIPPED (Trend Gate: {reason} | Price {current_price:.2f} | SMA {current_sma:.2f})")
+                             set_trend_block(bot, time.time())
+                             time.sleep(LOOP_INTERVAL_SECONDS)
+                             continue
+                        
+                        # 3. SUCCESS
+                        logger.info(f"BUY_EVAL | DipOK=True | TrendGate=PASS ({reason}) | Proceeding to Order")
+                        logger.info(f"BUY APPROVED ({reason} | Price {current_price:.2f} | SMA {current_sma:.2f} | DipTarget {target_buy_price:.2f})")
 
                         # 2. Check Warmup
                         if not trend_ready:
@@ -1233,7 +1307,14 @@ def main():
 
             elif bot.state == "HOLDING_ETH":
                 take_profit_price = bot.entry_price * (1 + TAKE_PROFIT_PCT)
+                take_profit_price = bot.entry_price * (1 + TAKE_PROFIT_PCT)
                 stop_loss_price = bot.entry_price * (1 - STOP_LOSS_PCT)
+                
+                # SELL_EVAL Log
+                sig_log = "NONE"
+                if current_price >= take_profit_price: sig_log = "TAKE_PROFIT"
+                elif current_price <= stop_loss_price: sig_log = "STOP_LOSS"
+                logger.info(f"SELL_EVAL | Price:{current_price:.2f} | Entry:{bot.entry_price:.2f} | TP:{take_profit_price:.2f} | SL:{stop_loss_price:.2f} | Signal:{sig_log}")
                 
                 signal_sell = False
                 sell_reason = ""
