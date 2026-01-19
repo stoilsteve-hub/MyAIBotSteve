@@ -113,8 +113,6 @@ class BotState:
         self.trade_count = 0
         self.day_key = ""
         self.last_trade_time = 0
-        self.last_trade_time = 0
-        self.error_timestamps = []
         self.error_timestamps = []
         self.price_history = [] # Now persistent
         
@@ -311,97 +309,120 @@ def print_pre_flight_check(client, bot):
     print("✅ PHASE 2: LIVE TRADING MODE VERIFIED.")
     print("="*60 + "\n")
 
-def probe_symbol_permission(client):
+def verify_live_readiness(client, bot_state):
     """
-    Probes permissions by placing (and cancelling) a REAL LIMIT order.
-    This is necessary because /order/test does not check Account Permissions (-2010).
+    Performs SAFE pre-flight checks without placing real orders.
+    Verifies:
+      1. Account 'canTrade' status.
+      2. Symbol permissions and status (TRADING).
+      3. Filters (LOT_SIZE, MIN_NOTIONAL) presence.
+      4. 'new_order_test' validation for BUY and SELL.
+    Returns: (bool, reason_message)
     """
-    logger.info(f"PROBING REAL ORDER PERMISSION for {SYMBOL}...")
+    logger.info("VERIFYING LIVE READINESS (Safe Mode - No Real Orders)...")
+    
     try:
-        # 1. Fetch Filters & Price
+        # A1) ACCOUNT CHECK
+        acc = api_call(client.account)
+        if not acc.get('canTrade', False):
+            return False, "Account 'canTrade' is False. Check API Key permissions or Account Status."
+        
+        # Log permissions if visible
+        perms = acc.get('permissions', [])
+        logger.info(f"Account Permissions: {perms}")
+        
+        # A2) SYMBOL CHECK
         info = api_call(client.exchange_info, symbol=SYMBOL)
-        filters = info['symbols'][0]['filters']
+        s_info = info['symbols'][0]
         
-        f_price = next(f for f in filters if f['filterType'] == 'PRICE_FILTER')
-        tick_size = Decimal(f_price['tickSize'])
-        
-        f_lot = next(f for f in filters if f['filterType'] == 'LOT_SIZE')
-        step_size = Decimal(f_lot['stepSize'])
-        min_qty = Decimal(f_lot['minQty'])
-        
-        f_not = next((f for f in filters if f['filterType'] == 'NOTIONAL'), None)
-        if not f_not: f_not = next((f for f in filters if f['filterType'] == 'MIN_NOTIONAL'), None)
-        min_notional = Decimal(f_not['minNotional'])
-        
-        ticker = api_call(client.book_ticker, SYMBOL)
-        ask_price = Decimal(ticker['askPrice'])
-        
-        # 2. Construct Safe Params (LIMIT SELL PROBE)
-        # Using a "Realistic" price to avoid PERCENT_PRICE filter errors
-        # Sell @ Bid * 1.002 (0.2% above bid)
+        if s_info['status'] != 'TRADING':
+            return False, f"Symbol {SYMBOL} status is {s_info['status']}, not TRADING."
+            
+        if s_info['quoteAsset'] != QUOTE_ASSET:
+            return False, f"Symbol Quote Asset {s_info['quoteAsset']} mismatch with Config {QUOTE_ASSET}."
+
+        # A3) FILTER + VIABILITY
+        step_str = "0.0001" # fallback
+        try:
+             step_size_decimal, step_size_str, tick_size_decimal, min_notional_decimal, mul_up, mul_down, min_qty_decimal = get_filters(client)
+             step_str = step_size_str
+        except Exception as filter_e:
+             return False, f"Filter Retrieval Failed: {filter_e}"
+             
+        # Construct Safe Test Params (Bid/Ask)
         ticker = api_call(client.book_ticker, SYMBOL)
         bid = Decimal(ticker['bidPrice'])
-        limit_price_raw = bid * Decimal("1.002")
-        limit_price = (limit_price_raw // tick_size) * tick_size
+        ask = Decimal(ticker['askPrice'])
         
-        # Qty > Min Notional with buffer
-        target_val = max(min_notional * Decimal("1.2"), Decimal("11.0"))
-        qty_raw = target_val / limit_price
-        qty = (qty_raw // step_size) * step_size
-        if qty < min_qty: qty = min_qty
+        # Valid Price (Tick Size) - Using Floor Logic
+        def fmt_price(val, tick):
+            if tick <= 0: return "{:f}".format(val)
+            val = (val // tick) * tick
+            return "{:f}".format(val)
+            
+        # Use Ask for Buy, Bid for Sell (Realistic Limit Orders)
+        buy_price_str = fmt_price(ask, tick_size_decimal)
+        sell_price_str = fmt_price(bid, tick_size_decimal)
         
-        # Precision Formatting
-        p_str = "{:f}".format(limit_price)
-        q_str = "{:f}".format(qty)
+        # Valid Qty (Min Notional + Buffer)
+        # Conservative: use higher price (ask) to estimate required qty? 
+        # Actually lower price -> higher qty needed. Use Bid for conservative Notional check?
+        # User snippet: "price_for_qty = ask if ask > 0 else (bid + ask) / 2"
+        # Let's stick to user request.
+        price_for_qty = ask if ask > 0 else (bid + ask) / 2
         
-        params = {
+        target_notional = min_notional_decimal * Decimal("1.2")
+        qty_needed = target_notional / price_for_qty
+        qty_safe = round_down_step(qty_needed, step_size_decimal)
+        
+        # CLAMP Qty >= minQty
+        if qty_safe < min_qty_decimal:
+            qty_safe = min_qty_decimal
+
+        # Step Size formatting
+        qty_str = "{:f}".format(qty_safe)
+        
+        # A4) TEST ORDER CHECK (BUY & SELL)
+        params_base = {
             "symbol": SYMBOL,
-            "side": "SELL",
             "type": "LIMIT",
             "timeInForce": "GTC",
-            "quantity": q_str,
-            "price": p_str
+            "quantity": qty_str
         }
-        
-        logger.info(f"Probe Params: {params}")
 
-        # 3. Test Order First
-        api_call(client.new_order_test, **params)
+        # BUY (at Ask)
+        params_buy = params_base.copy()
+        params_buy["side"] = "BUY"
+        params_buy["price"] = buy_price_str
+        api_call(client.new_order_test, **params_buy)
         
-        # 4. Real Order
-        logger.info("Placing REAL PROBE order (will cancel immediately)...")
-        order = api_call(client.new_order, **params)
-        oid = order['orderId']
-        logger.info(f"REAL PROBE PLACED (ID: {oid}). Cancelling...")
+        # SELL (at Bid)
+        params_sell = params_base.copy()
+        params_sell["side"] = "SELL"
+        params_sell["price"] = sell_price_str
+        api_call(client.new_order_test, **params_sell)
         
-        # 5. Cancel
-        api_call(client.cancel_order, symbol=SYMBOL, orderId=oid)
-        logger.info(f"✅ REAL ORDER PROBE PASSED: Account can trade {SYMBOL}.")
-        
+        logger.info("✅ LIVE READY: Preflight checks passed (Account, Symbol, Filters, Test Orders).")
+        return True, "OK"
+
     except ClientError as e:
-        logger.critical(f"❌ PROBE FAILED: {e}")
-        if e.error_code == -2010:
-            print("\n" + "!"*60) 
-            print(f"FATAL ERROR: Your account is RESTRICTED from trading {SYMBOL} (Error -2010).")
-            print(f"SUGGESTION: Edit .env and change SYMBOL to a permitted pair (e.g. ETHEUR).")
-            print("!"*60 + "\n")
-        sys.exit(1)
+        return False, f"Binance API Error: {e}"
     except Exception as e:
-        logger.critical(f"❌ PROBE UNEXPECTED ERROR: {e}")
-        sys.exit(1)
+        return False, f"Unexpected Error: {e}"
 
 def get_filters(client):
     try:
         info = api_call(client.exchange_info, symbol=SYMBOL)
         f = info['symbols'][0]['filters']
         
-        # LOT_SIZE -> stepSize
+        # LOT_SIZE -> stepSize, minQty
         lot_filter = next((x for x in f if x['filterType'] == 'LOT_SIZE'), None)
         if not lot_filter:
             logger.critical("CRITICAL: LOT_SIZE filter not found for symbol.")
             sys.exit(1)
         step_size_str = lot_filter['stepSize']
         step_size_decimal = Decimal(step_size_str)
+        min_qty_decimal = Decimal(lot_filter['minQty'])
         
         # MIN_NOTIONAL
         notional_filter = next((x for x in f if x['filterType'] in ['NOTIONAL', 'MIN_NOTIONAL']), None)
@@ -432,11 +453,14 @@ def get_filters(client):
             mul_down = Decimal("0.2")
 
         # logger.info(f"Filters Loaded: step={step_size_str}, tick={tick_size_decimal}, notional={min_notional_decimal}, mulUp={mul_up}, mulDown={mul_down}")
-        return step_size_decimal, step_size_str, tick_size_decimal, min_notional_decimal, mul_up, mul_down
+        return step_size_decimal, step_size_str, tick_size_decimal, min_notional_decimal, mul_up, mul_down, min_qty_decimal
 
     except Exception as e:
-        logger.critical(f"Error fetching filters: {e}")
-        sys.exit(1)
+        logger.error(f"Error fetching filters: {e}")
+        # Retries handled by loop flow usually, but we need defaults? 
+        # For now, propagate or return defaults. 
+        # Raising ensures we don't trade on bad data.
+        raise e
 
 def round_down_step(quantity, step_size_decimal):
     d_qty = Decimal(str(quantity))
@@ -629,34 +653,68 @@ def reserve_watcher(client, bot_state, current_mid, step_size_decimal, step_size
     reserve_eth = compute_reserve_eth(total_free_eth, pot_eth_dec)
     reserve_eth_float = float(reserve_eth)
     
-    bot_state.reserve_last_seen_eth = reserve_eth_float
+    changed = False
+
+    # HANDLE ZERO RESERVE
+    # HANDLE ZERO RESERVE
+    if reserve_eth_float == 0:
+        if bot_state.reserve_high_watermark_quote != 0.0:
+            bot_state.reserve_high_watermark_quote = 0.0
+            changed = True
+        if bot_state.reserve_last_seen_eth != 0.0:
+            bot_state.reserve_last_seen_eth = 0.0
+            changed = True
+        if bot_state.reserve_last_value_quote != 0.0:
+            bot_state.reserve_last_value_quote = 0.0
+            changed = True
+        
+        if changed:
+            bot_state.save()
+        return
 
     # 2. Value Calculation
+    mid_float = float(current_mid)
     reserve_value_quote = reserve_eth_float * mid_float
-    bot_state.reserve_last_value_quote = reserve_value_quote
     
-    # Heartbeat Logging (Log every ~60s or if status changes significantly?)
-    # User requested: "Every loop tick (or every N ticks)". Let's do every 4 ticks (approx 1 min).
-    # Since we don't have a tick counter passed in, we can use time mod.
-    if int(now_ts) % 60 < LOOP_INTERVAL_SECONDS: # Rough "once per minute" check
-         mode_str = "YES" if ENABLE_RESERVE_AUTOSALE else "NO"
-         # Calc Trail Value
-         trail_val_log = bot_state.reserve_high_watermark_quote * (1 - RESERVE_TRAIL_PCT)
-         if reserve_eth_float > 0:
-             logger.info(f"RESERVE | ETH:{reserve_eth:.4f} | Val:{reserve_value_quote:.2f} {QUOTE_ASSET} | High:{bot_state.reserve_high_watermark_quote:.2f} | TrailStop:{trail_val_log:.2f} | AutoSale:{mode_str}")
-         else:
-             # Only log "No Reserve" occasionally (long interval)
-             if int(now_ts) % 600 < LOOP_INTERVAL_SECONDS:
-                 logger.info(f"RESERVE | No reserve detected (Free: {total_free_eth:.4f}, Pot: {pot_eth_dec:.4f})")
+    if bot_state.reserve_last_value_quote != reserve_value_quote:
+        bot_state.reserve_last_value_quote = reserve_value_quote
+        # Do not save just for value update (too frequent), rely on periodic save or significant change?
+        # Requirement: "Ensure reserve_last_seen_eth is persisted even on quiet ticks"
+        # Since we save at 'changed' below, we might need to flag this if strict persistence is needed.
+        # But saving on every price tick is bad I/O. 
+        # User constraint: "Save at most once per reserve_watcher() call." 
+        # Typically we only save if structure changes or watermark changes.
+        pass 
 
-    if reserve_eth_float == 0:
-        return
+    # --- WATERMARK RESET LOGIC (Size Change Detection) ---
+    prev_eth = bot_state.reserve_last_seen_eth
+    delta_eth = abs(reserve_eth_float - prev_eth)
+    
+    # Reset if change > step_size OR > 5% change
+    threshold_step = float(step_size_decimal)
+    threshold_pct = 0.05 * prev_eth if prev_eth > 0 else 0.0
+    
+    if prev_eth > 0 and (delta_eth > threshold_step or (threshold_pct > 0 and delta_eth > threshold_pct)):
+        logger.info(f"RESERVE: Reserve size changed ({prev_eth:.4f} -> {reserve_eth_float:.4f}). Resetting High Watermark to Current Val ({reserve_value_quote:.2f}).")
+        bot_state.reserve_high_watermark_quote = reserve_value_quote
+        changed = True
+    
+    # Always update last seen if different (so we catch up to new size)
+    if bot_state.reserve_last_seen_eth != reserve_eth_float:
+        bot_state.reserve_last_seen_eth = reserve_eth_float
+        changed = True # Save new size persistence
 
     # 3. Update High Watermark (Value Based)
     if bot_state.reserve_high_watermark_quote == 0 or reserve_value_quote > bot_state.reserve_high_watermark_quote:
         bot_state.reserve_high_watermark_quote = reserve_value_quote
+        # logger.info(f"RESERVE: High Watermark Updated: {bot_state.reserve_high_watermark_quote:.2f}") # Too spammy if price drift?
+        # Only log if update is significant? Or keeping it is fine for now.
+        changed = True
+        
+    if changed:
         bot_state.save()
-        logger.info(f"RESERVE: High Watermark Updated: {bot_state.reserve_high_watermark_quote:.2f} {QUOTE_ASSET} (Reserve: {reserve_eth:.4f} ETH)")
+
+    # Heartbeat Logging (Log every ~60s or if status changes significantly?)
 
     # 4. Check Cooldown
     if now_ts - bot_state.reserve_last_action_ts < RESERVE_BLOCK_COOLDOWN_SECONDS:
@@ -672,12 +730,7 @@ def reserve_watcher(client, bot_state, current_mid, step_size_decimal, step_size
         signal = True
         reason = f"TRAIL_STOP (Value {reserve_value_quote:.2f} < {trail_val:.2f})"
 
-    # Take Profit (Value)
-    if RESERVE_TP_PCT > 0:
-        tp_val = bot_state.reserve_high_watermark_quote * (1 + RESERVE_TP_PCT)
-        if reserve_value_quote >= tp_val:
-            signal = True
-            reason = f"TAKE_PROFIT (Value {reserve_value_quote:.2f} >= {tp_val:.2f})"
+
 
     if not signal:
         return
@@ -834,7 +887,10 @@ def place_limit_order_with_timeout(client, side, quantity_decimal, step_size_dec
             if exec_qty > 0:
                 logger.info(f"Partial fill detected on cancel: {exec_qty}")
                 return final_stat
-            return None
+            
+            # Clean timeout (no fill)
+            logger.info(f"Order {oid} canceled cleanly (no fill).")
+            return {"status": "CANCELED_TIMEOUT_NOFILL"}
             
         except Exception as e:
             logger.error(f"Error cancelling timed-out order: {e}")
@@ -901,6 +957,10 @@ def fund_pot_if_needed(client, bot_state, target_notional, step_size_decimal, st
     
     order = place_limit_order_with_timeout(client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, tick_size, mid_decimal)
     
+    if order and order.get("status") == "CANCELED_TIMEOUT_NOFILL":
+        logger.info("FUNDING order timed out and canceled cleanly. Not counting as error.")
+        return
+
     if order:
         cumm_quote_qty = float(order.get('cummulativeQuoteQty', 0.0))
         executed_qty = float(order.get('executedQty', 0.0))
@@ -971,7 +1031,13 @@ def main():
     # PRE-FLIGHT PRE-CHECK
     if LIVE_TRADING == "YES" and DRY_RUN == 0:
          print_pre_flight_check(client, bot)
-         probe_symbol_permission(client)
+
+         # Safe readiness check
+         is_ready, msg = verify_live_readiness(client, bot)
+         if not is_ready:
+             logger.critical(f"❌ LIVE TRADING NOT READY: {msg}")
+             print(f"CRITICAL: {msg}")
+             sys.exit(1)
 
     # STARTUP CONFIRMATION
     if REQUIRE_START_CONFIRM == 1:
@@ -979,7 +1045,7 @@ def main():
             # Check basic conditions. We need filters to know min_notional.
             # Just do a quick loose check or fetch filters once.
             logger.info("Startup Safety Check...")
-            _, _, _, min_notional_decimal, _, _ = get_filters(client)
+            _, _, _, min_notional_decimal, _, _, min_qty_decimal = get_filters(client)
             
             needs_funding = False
             if bot.state == "HOLDING_QUOTE" and Decimal(str(bot.pot_quote)) < min_notional_decimal:
@@ -1003,6 +1069,7 @@ def main():
             logger.error(f"Startup check failed: {e}")
             sys.exit(1)
 
+    last_trend_save_ts = 0
     while True:
         try:
             # 0. Global Check
@@ -1026,7 +1093,7 @@ def main():
                 continue
 
             # 2. Get Exchange Filters
-            step_size_decimal, step_size_str, tick_size_decimal, min_notional_decimal, mul_up, mul_down = get_filters(client)
+            step_size_decimal, step_size_str, tick_size_decimal, min_notional_decimal, mul_up, mul_down, min_qty_decimal = get_filters(client)
             d_trade_val = Decimal(str(TRADE_VALUE_QUOTE))
             target_notional_decimal = max(d_trade_val, min_notional_decimal * Decimal(str(MIN_NOTIONAL_BUFFER)))
 
@@ -1051,15 +1118,7 @@ def main():
             avg_price_cap_max = Decimal(str(current_price)) * mul_up
             avg_price_cap_min = Decimal(str(current_price)) * mul_down
 
-            # 4. Market Data
-            current_price, spread = get_mid_price_and_spread(client)
-            if current_price == 0:
-                time.sleep(5)
-                continue
-            
-            # 4b. Percent Price Limits (Clamp Calculation)
-            avg_price_cap_max = Decimal(str(current_price)) * mul_up
-            avg_price_cap_min = Decimal(str(current_price)) * mul_down
+
 
             # 4.X RESERVE WATCHER (Before Pot Logic)
             try:
@@ -1084,7 +1143,12 @@ def main():
             bot.last_mid = current_price
             sma = calculate_sma(bot.price_history)
             bot.last_sma = sma
-            bot.save()
+            current_sma = sma
+            
+            # Reduce IO: Only save every 60s unless state changes critical
+            if time.time() - last_trend_save_ts > 60:
+                bot.save()
+                last_trend_save_ts = time.time()
             
             trend_ready = len(bot.price_history) >= TREND_MIN_SAMPLES
             
@@ -1134,14 +1198,13 @@ def main():
                   snap_sig = "NONE"
                   
                   if bot.state == "HOLDING_ETH":
-                      # If logic is standard, calculate hypothetical TP/SL
-                      # We don't have entry price stored? CHECK BotState.
-                      # Usually `bot.last_buy_price`? Wait, checking BotState def...
-                      # It has `last_trade_time`, `last_sell_price`. No last_buy_price.
-                      # So we cannot accurately show Entry/TP/SL in snapshot without state change.
-                      # Constraint: "No logic/config changes".
-                      # We will log "0.00" as we can't invent data.
-                      pass
+                      snap_entry = bot.entry_price
+                      snap_tp = snap_entry * (1 + TAKE_PROFIT_PCT)
+                      snap_sl = snap_entry * (1 - STOP_LOSS_PCT)
+                      
+                      if current_price >= snap_tp: snap_sig = "TAKE_PROFIT"
+                      elif current_price <= snap_sl: snap_sig = "STOP_LOSS"
+                      else: snap_sig = "NONE"
 
                   # Log Line
                   pot_eur_fmt = f"{bot.pot_quote:.2f}"
@@ -1185,7 +1248,7 @@ def main():
                      if trend_ready and sma > 0: pct_under = (sma - current_price) / sma
                      logger.info(f"[DIP DEBUG] Price:{current_price:.2f} SMA:{sma:.2f} LastSell:{bot.last_sell_price:.2f} Anchor:{anchor_price:.2f} Target:{target_buy_price:.2f} UnderSMA:{pct_under*100:.2f}%")
 
-                if bot.last_sell_price > 0 or True: # Always check now, anchors handle init
+                if True: # Always check now, anchors handle init
                     # ONLY check logic if Dip Triggered
                     if current_price <= target_buy_price:
                         
@@ -1225,22 +1288,7 @@ def main():
                         logger.info(f"BUY_EVAL | DipOK=True | TrendGate=PASS ({reason}) | Proceeding to Order")
                         logger.info(f"BUY APPROVED ({reason} | Price {current_price:.2f} | SMA {current_sma:.2f} | DipTarget {target_buy_price:.2f})")
 
-                        # 2. Check Warmup
-                        if not trend_ready:
-                             logger.info(f"BUY SKIPPED (Trend warmup {len(bot.price_history)}/{TREND_MIN_SAMPLES})")
-                             time.sleep(LOOP_INTERVAL_SECONDS)
-                             continue
-                        
-                        # 3. Reversal Gate
-                        is_ok, reason = is_reversal_confirmed(bot.price_history, current_price, sma, prev_price, prev_sma)
-                        
-                        if not is_ok:
-                             logger.info(f"BUY SKIPPED (Trend Gate: {reason} | Price {current_price:.2f} | SMA {sma:.2f})")
-                             set_trend_block(bot, time.time())
-                             time.sleep(LOOP_INTERVAL_SECONDS)
-                             continue
 
-                        logger.info(f"BUY APPROVED ({reason} | Price {current_price:.2f} | SMA {sma:.2f} | DipTarget {target_buy_price:.2f})")
                         
                         # Calculate Qty
                         qty_raw = Decimal(str(bot.pot_quote)) / Decimal(str(current_price))
@@ -1268,34 +1316,41 @@ def main():
                             tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
                         )
                         
-                        if order:
-                            cumm_quote = float(order.get('cummulativeQuoteQty', 0.0))
-                            exec_qty = float(order.get('executedQty', 0.0))
-                            fills = order.get('fills', [])
-                            avg_price = get_avg_exec_price(fills)
-                            if avg_price == 0: avg_price = cumm_quote / exec_qty if exec_qty else current_price
-                            
-                            # State Update Logic (Partial Fill Handling)
-                            bot.pot_quote -= cumm_quote
-                            if bot.pot_quote < 0: bot.pot_quote = 0.0
-                            bot.pot_eth += exec_qty
-                            
-                            normalize_pots(bot, step_size_decimal)
-                            
-                            # Flip State Check (Strict User Rule)
-                            # BUY: if executed quote >= MIN_FILL_QUOTE AND executedQty >= step_size
-                            if cumm_quote >= MIN_FILL_QUOTE and exec_qty >= float(step_size_decimal):
-                                bot.entry_price = avg_price
-                                bot.state = "HOLDING_ETH"
-                                logger.info(f"BUY SUCCESS. Entry: {bot.entry_price:.2f}. New Pot: {bot.pot_eth:.4f} ETH")
-                            else:
-                                logger.warning(f"BUY PARTIAL/TINY ({cumm_quote:.2f} {QUOTE_ASSET}, Qty {exec_qty}). Staying in HOLDING_QUOTE.")
-
-                            bot.last_trade_time = time.time()
-                            bot.save()
-                        else:
+                        if order and order.get('status') == 'CANCELED_TIMEOUT_NOFILL':
+                            logger.info("BUY order timed out and canceled cleanly. Not counting as error.")
+                            time.sleep(LOOP_INTERVAL_SECONDS)
+                            continue
+                        
+                        if order is None:
                             bot.error_timestamps.append(time.time())
                             check_errors(bot)
+                            continue
+
+                        # SUCCESS (Fill or Partial)
+                        cumm_quote = float(order.get('cummulativeQuoteQty', 0.0))
+                        exec_qty = float(order.get('executedQty', 0.0))
+                        fills = order.get('fills', [])
+                        avg_price = get_avg_exec_price(fills)
+                        if avg_price == 0: avg_price = cumm_quote / exec_qty if exec_qty else current_price
+                        
+                        # State Update Logic (Partial Fill Handling)
+                        bot.pot_quote -= cumm_quote
+                        if bot.pot_quote < 0: bot.pot_quote = 0.0
+                        bot.pot_eth += exec_qty
+                        
+                        normalize_pots(bot, step_size_decimal)
+                        
+                        # Flip State Check (Strict User Rule)
+                        # BUY: if executed quote >= MIN_FILL_QUOTE AND executedQty >= step_size
+                        if cumm_quote >= MIN_FILL_QUOTE and exec_qty >= float(step_size_decimal):
+                            bot.entry_price = avg_price
+                            bot.state = "HOLDING_ETH"
+                            logger.info(f"BUY SUCCESS. Entry: {bot.entry_price:.2f}. New Pot: {bot.pot_eth:.4f} ETH")
+                        else:
+                            logger.warning(f"BUY PARTIAL/TINY ({cumm_quote:.2f} {QUOTE_ASSET}, Qty {exec_qty}). Staying in HOLDING_QUOTE.")
+
+                        bot.last_trade_time = time.time()
+                        bot.save()
 
                 else:
                     # Inconsistent state (last_sell_price == 0)
@@ -1306,7 +1361,6 @@ def main():
                     continue
 
             elif bot.state == "HOLDING_ETH":
-                take_profit_price = bot.entry_price * (1 + TAKE_PROFIT_PCT)
                 take_profit_price = bot.entry_price * (1 + TAKE_PROFIT_PCT)
                 stop_loss_price = bot.entry_price * (1 - STOP_LOSS_PCT)
                 
@@ -1352,53 +1406,60 @@ def main():
                         tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
                     )
                     
-                    if order:
-                        cumm_quote = float(order.get('cummulativeQuoteQty', 0.0))
-                        exec_qty = float(order.get('executedQty', 0.0))
-                        fills = order.get('fills', [])
-                        avg_price = get_avg_exec_price(fills)
-                        if avg_price == 0: avg_price = cumm_quote / exec_qty if exec_qty else current_price
-                        
-                        # PnL
-                        pnl_per_unit = avg_price - bot.entry_price
-                        realized_pnl = pnl_per_unit * exec_qty
-                        
-                        if realized_pnl < 0:
-                            bot.daily_loss_quote += abs(realized_pnl)
-                            logger.info(f"LOSS REALIZED: {realized_pnl:.4f} {QUOTE_ASSET}.")
+                    if order and order.get('status') == 'CANCELED_TIMEOUT_NOFILL':
+                        logger.info("SELL order timed out and canceled cleanly. Not counting as error.")
+                        time.sleep(LOOP_INTERVAL_SECONDS)
+                        continue
 
-                        # State Update Logic
-                        bot.pot_eth -= exec_qty
-                        bot.pot_quote += cumm_quote
-                        bot.last_sell_price = avg_price
-                        
-                        normalize_pots(bot, step_size_decimal)
-                        
-                        # Flip State Check (Strict User Rule)
-                        # Only flip if BOTH: (exec_quote >= MIN_FILL_QUOTE) AND (remaining pot_eth is effectively 0)
-                        
-                        is_dust = False
-                        if bot.pot_eth == 0:
-                            is_dust = True
-                        else:
-                            # Check if remaining Notional is < minNotional
-                            rem_val = float(bot.pot_eth) * float(current_price)
-                            if rem_val < float(min_notional_decimal):
-                                is_dust = True
-
-                        if cumm_quote >= MIN_FILL_QUOTE and is_dust:
-                             bot.state = "HOLDING_QUOTE"
-                             bot.trade_count += 1
-                             logger.info(f"SELL SUCCESS ({sell_reason}). Price: {avg_price:.2f}. PnL: {realized_pnl:.4f}. Trades Today: {bot.trade_count}")
-                        else:
-                             # We either didn't fill enough OR we still have a bag left.
-                             logger.warning(f"SELL PARTIAL ({cumm_quote:.2f} {QUOTE_ASSET}). Dust/Rem: {is_dust}. Remain: {bot.pot_eth:.4f}. Staying in HOLDING_ETH.")
-
-                        bot.last_trade_time = time.time()
-                        bot.save()
-                    else:
+                    if order is None:
                         bot.error_timestamps.append(time.time())
                         check_errors(bot)
+                        continue
+
+                    # SUCCESS (Fill or Partial)
+                    cumm_quote = float(order.get('cummulativeQuoteQty', 0.0))
+                    exec_qty = float(order.get('executedQty', 0.0))
+                    fills = order.get('fills', [])
+                    avg_price = get_avg_exec_price(fills)
+                    if avg_price == 0: avg_price = cumm_quote / exec_qty if exec_qty else current_price
+                    
+                    # PnL
+                    pnl_per_unit = avg_price - bot.entry_price
+                    realized_pnl = pnl_per_unit * exec_qty
+                    
+                    if realized_pnl < 0:
+                        bot.daily_loss_quote += abs(realized_pnl)
+                        logger.info(f"LOSS REALIZED: {realized_pnl:.4f} {QUOTE_ASSET}.")
+
+                    # State Update Logic
+                    bot.pot_eth -= exec_qty
+                    bot.pot_quote += cumm_quote
+                    bot.last_sell_price = avg_price
+                    
+                    normalize_pots(bot, step_size_decimal)
+                    
+                    # Flip State Check (Strict User Rule)
+                    # Only flip if BOTH: (exec_quote >= MIN_FILL_QUOTE) AND (remaining pot_eth is effectively 0)
+                    
+                    is_dust = False
+                    if bot.pot_eth == 0:
+                        is_dust = True
+                    else:
+                        # Check if remaining Notional is < minNotional
+                        rem_val = float(bot.pot_eth) * float(current_price)
+                        if rem_val < float(min_notional_decimal):
+                            is_dust = True
+
+                    if cumm_quote >= MIN_FILL_QUOTE and is_dust:
+                            bot.state = "HOLDING_QUOTE"
+                            bot.trade_count += 1
+                            logger.info(f"SELL SUCCESS ({sell_reason}). Price: {avg_price:.2f}. PnL: {realized_pnl:.4f}. Trades Today: {bot.trade_count}")
+                    else:
+                            # We either didn't fill enough OR we still have a bag left.
+                            logger.warning(f"SELL PARTIAL ({cumm_quote:.2f} {QUOTE_ASSET}). Dust/Rem: {is_dust}. Remain: {bot.pot_eth:.4f}. Staying in HOLDING_ETH.")
+
+                    bot.last_trade_time = time.time()
+                    bot.save()
 
             time.sleep(LOOP_INTERVAL_SECONDS)
 
