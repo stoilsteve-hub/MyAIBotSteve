@@ -66,6 +66,21 @@ REVERSAL_SAMPLES = get_env("REVERSAL_SAMPLES", 3, int)
 TREND_BLOCK_COOLDOWN_SECONDS = get_env("TREND_BLOCK_COOLDOWN_SECONDS", 300, int)
 MIN_TREND_SPREAD_PCT = get_env("MIN_TREND_SPREAD_PCT", 0.0, float) # e.g. 0.001 for 0.1% buffer
 
+# Reserve Watcher (Monitors NON-POT ETH)
+ENABLE_RESERVE_WATCHER = get_env("ENABLE_RESERVE_WATCHER", "YES") == "YES"
+ENABLE_RESERVE_AUTOSALE = get_env("ENABLE_RESERVE_AUTOSALE", "NO") == "YES"
+RESERVE_MIN_ETH = get_env("RESERVE_MIN_ETH", 0.0010, float)
+RESERVE_TRAIL_PCT = get_env("RESERVE_TRAIL_PCT", 0.03, float) # 3% Trailing Stop
+RESERVE_TP_PCT = get_env("RESERVE_TP_PCT", 0.05, float)        # 5% Take Profit
+RESERVE_BLOCK_COOLDOWN_SECONDS = get_env("RESERVE_BLOCK_COOLDOWN_SECONDS", 300, int)
+RESERVE_MAX_SELL_ETH = get_env("RESERVE_MAX_SELL_ETH", 0.01, float)
+
+# Dynamic Dip Anchor
+DIP_ANCHOR_MODE = get_env("DIP_ANCHOR_MODE", "BLEND") # BLEND, SMA_ONLY, LAST_SELL_ONLY
+DIP_BLEND_SMA_WEIGHT = get_env("DIP_BLEND_SMA_WEIGHT", 0.7, float)
+MAX_UNDER_SMA_PCT = get_env("MAX_UNDER_SMA_PCT", 0.03, float) # 3% limit below SMA
+DIP_TARGET_DEBUG = get_env("DIP_TARGET_DEBUG", 1, int) == 1
+
 TIMEZONE_STR = get_env("TIMEZONE", "Europe/Stockholm")
 BASE_URL = get_env("BASE_URL", "https://api.binance.com")
 
@@ -107,6 +122,13 @@ class BotState:
         self.trend_block_until = 0
         self.last_sma = 0.0
         self.last_mid = 0.0
+        
+        
+        # Reserve Watcher Fields
+        self.reserve_high_watermark_quote = 0.0
+        self.reserve_last_value_quote = 0.0
+        self.reserve_last_action_ts = 0
+        self.reserve_last_seen_eth = 0.0
 
     def load(self):
         if os.path.exists(STATE_FILE):
@@ -150,6 +172,13 @@ class BotState:
                     self.trend_block_until = data.get("trend_block_until", 0)
                     self.last_sma = data.get("last_sma", 0.0)
                     self.last_mid = data.get("last_mid", 0.0)
+                    
+                    
+                    # Reserve Watcher State
+                    self.reserve_high_watermark_quote = data.get("reserve_high_watermark_quote", 0.0)
+                    self.reserve_last_value_quote = data.get("reserve_last_value_quote", 0.0)
+                    self.reserve_last_action_ts = data.get("reserve_last_action_ts", 0)
+                    self.reserve_last_seen_eth = data.get("reserve_last_seen_eth", 0.0)
                     
                     logger.info("State loaded successfully.")
             except Exception as e:
@@ -223,6 +252,11 @@ def print_pre_flight_check(client, bot):
     print("="*60)
     
     # 1. Config
+    print("[-] RESERVE WATCHER:")
+    print(f"    ENABLED: {ENABLE_RESERVE_WATCHER}")
+    print(f"    AUTOSALE: {ENABLE_RESERVE_AUTOSALE}")
+    print(f"    TRAIL: {RESERVE_TRAIL_PCT*100}% | TP: {RESERVE_TP_PCT*100}%")
+    
     print(f"[-] CONFIGURATION:")
     print(f"    DRY_RUN: {DRY_RUN}")
     print(f"    LIVE_TRADING: {LIVE_TRADING}")
@@ -552,6 +586,144 @@ def is_reversal_confirmed(price_history, current_price, current_sma, prev_price,
                 return False, "REVERSAL_BOUNCE3_BLOCKED"
                 
     return False, "UNKNOWN_MODE"
+
+def get_free_balance(client, asset):
+    """Fetches free balance of a specific asset from Binance."""
+    try:
+        info = client.account()
+        balances = info.get('balances', [])
+        for b in balances:
+            if b['asset'] == asset:
+                return Decimal(b['free'])
+        return Decimal("0.0")
+    except Exception as e:
+        logger.error(f"Error fetching balance for {asset}: {e}")
+        return Decimal("0.0")
+
+def compute_reserve_eth(account_free_eth, pot_eth):
+    """Calculates reserve ETH (Free - Pot), clamped to 0 if < MIN."""
+    reserve = account_free_eth - pot_eth
+    if reserve < Decimal(str(RESERVE_MIN_ETH)):
+        return Decimal("0.0")
+    return reserve
+
+def reserve_watcher(client, bot_state, current_mid, step_size_decimal, step_size_str, tick_size_decimal, min_notional_decimal, avg_price_cap_min, avg_price_cap_max):
+    """
+    Monitors ETH outside the pot. Trailing stop logic (Value-based) to sell reserve ETH.
+    """
+    if not ENABLE_RESERVE_WATCHER:
+        # Log occasionally? Or just ignore.
+        return
+
+    now_ts = time.time()
+    mid_float = float(current_mid)
+    
+    # 1. Calculate Reserve
+    try:
+        total_free_eth = get_free_balance(client, "ETH")
+    except Exception as e:
+        logger.error(f"Reserve error fetching ETH: {e}")
+        return
+
+    pot_eth_dec = Decimal(str(bot_state.pot_eth))
+    reserve_eth = compute_reserve_eth(total_free_eth, pot_eth_dec)
+    reserve_eth_float = float(reserve_eth)
+    
+    bot_state.reserve_last_seen_eth = reserve_eth_float
+
+    # 2. Value Calculation
+    reserve_value_quote = reserve_eth_float * mid_float
+    bot_state.reserve_last_value_quote = reserve_value_quote
+    
+    # Heartbeat Logging (Log every ~60s or if status changes significantly?)
+    # User requested: "Every loop tick (or every N ticks)". Let's do every 4 ticks (approx 1 min).
+    # Since we don't have a tick counter passed in, we can use time mod.
+    if int(now_ts) % 60 < LOOP_INTERVAL_SECONDS: # Rough "once per minute" check
+         mode_str = "AUTOSALE" if ENABLE_RESERVE_AUTOSALE else "MONITOR"
+         if reserve_eth_float > 0:
+             logger.info(f"RESERVE: {reserve_eth:.4f} ETH | Val: {reserve_value_quote:.2f} {QUOTE_ASSET} | High: {bot_state.reserve_high_watermark_quote:.2f} | Mode: {mode_str}")
+         else:
+             # Only log "No Reserve" occasionally (long interval)
+             if int(now_ts) % 600 < LOOP_INTERVAL_SECONDS:
+                 logger.info(f"RESERVE: No reserve detected (Free: {total_free_eth:.4f}, Pot: {pot_eth_dec:.4f})")
+
+    if reserve_eth_float == 0:
+        return
+
+    # 3. Update High Watermark (Value Based)
+    if bot_state.reserve_high_watermark_quote == 0 or reserve_value_quote > bot_state.reserve_high_watermark_quote:
+        bot_state.reserve_high_watermark_quote = reserve_value_quote
+        bot_state.save()
+        logger.info(f"RESERVE: High Watermark Updated: {bot_state.reserve_high_watermark_quote:.2f} {QUOTE_ASSET} (Reserve: {reserve_eth:.4f} ETH)")
+
+    # 4. Check Cooldown
+    if now_ts - bot_state.reserve_last_action_ts < RESERVE_BLOCK_COOLDOWN_SECONDS:
+        return
+
+    # 5. Check Triggers
+    signal = False
+    reason = ""
+    
+    # Value Trailing Stop: Value < High * (1 - trail)
+    trail_val = bot_state.reserve_high_watermark_quote * (1 - RESERVE_TRAIL_PCT)
+    if reserve_value_quote <= trail_val and bot_state.reserve_high_watermark_quote > 0:
+        signal = True
+        reason = f"TRAIL_STOP (Value {reserve_value_quote:.2f} < {trail_val:.2f})"
+
+    # Take Profit (Value)
+    if RESERVE_TP_PCT > 0:
+        tp_val = bot_state.reserve_high_watermark_quote * (1 + RESERVE_TP_PCT)
+        if reserve_value_quote >= tp_val:
+            signal = True
+            reason = f"TAKE_PROFIT (Value {reserve_value_quote:.2f} >= {tp_val:.2f})"
+
+    if not signal:
+        return
+
+    # 6. Execute
+    if signal:
+        if not ENABLE_RESERVE_AUTOSALE:
+            if int(now_ts) % 60 < LOOP_INTERVAL_SECONDS: # Log warning sparingly
+                logger.warning(f"RESERVE SELL SIGNAL ({reason}) - AutoSale DISABLED.")
+            return
+
+        # SELL LOGIC
+        logger.info(f"RESERVE SELL TRIGGERED: {reason}. Reserve: {reserve_eth:.4f} ETH")
+        
+        # Cap size
+        qty_to_sell = min(reserve_eth, Decimal(str(RESERVE_MAX_SELL_ETH)))
+        qty_to_sell = round_down_step(qty_to_sell, step_size_decimal)
+        
+        d_mid = Decimal(str(current_mid))
+        if qty_to_sell * d_mid < min_notional_decimal:
+            logger.warning("RESERVE: Sell quantity too small for MinNotional. Skipping.")
+            return
+
+        order = place_limit_order_with_timeout(
+            client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, 
+            tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+        )
+        
+        if order:
+            cumm_quote = float(order.get('cummulativeQuoteQty', 0.0))
+            exec_qty = float(order.get('executedQty', 0.0))
+            
+            logger.info(f"RESERVE: SELL EXECUTED. Qty: {exec_qty:.4f}. Returns: {cumm_quote:.2f} {QUOTE_ASSET}. (Not added to Pot)")
+            
+            bot_state.reserve_last_action_ts = now_ts
+            
+            # Reset / Update High Watermark Logic
+            # If we sold PART of "Value", the new "Value" (remaining) is naturally lower.
+            # Triggers might loop if we don't reset watermark to "Current".
+            # Simplest: Reset Watermark to 0 (Fresh start) or Set to Current Remaining Value.
+            # User Prompt: "After sell, set reserve_high_watermark_quote = 0"
+            bot_state.reserve_high_watermark_quote = 0.0 
+                
+            bot_state.save()
+        else:
+            logger.error("RESERVE: Order Failed/Timeout.")
+            bot_state.reserve_last_action_ts = now_ts # Cooldown
+            bot_state.save()
 
 # ==================================================================================
 # TRADING ACTIONS
@@ -887,6 +1059,16 @@ def main():
             avg_price_cap_max = Decimal(str(current_price)) * mul_up
             avg_price_cap_min = Decimal(str(current_price)) * mul_down
 
+            # 4.X RESERVE WATCHER (Before Pot Logic)
+            try:
+                reserve_watcher(
+                    client, bot, current_price, step_size_decimal, step_size_str, 
+                    tick_size_decimal, min_notional_decimal, avg_price_cap_min, avg_price_cap_max
+                )
+            except Exception as e:
+                logger.error(f"Reserve Watcher Crashed (Ignored): {e}")
+                # Don't stop bot, just log
+
             # 4c. Trend Data Collection & Persistence
             # Store previous values for CrossUp logic
             prev_price = bot.price_history[-1] if bot.price_history else current_price
@@ -922,13 +1104,47 @@ def main():
 
             # 5. Logic
             if bot.state == "HOLDING_QUOTE":
-                # Signal: Price Drop
-                target_buy_price = bot.last_sell_price * (1 - BUY_DROP_PCT)
+                # Signal: Price Drop Logic (Dynamic Anchor)
+                # Compute Anchor
+                anchor_price = bot.last_sell_price
+                if anchor_price <= 0: anchor_price = current_price # Fallback init
+
+                is_falling_knife = False
                 
-                if bot.last_sell_price > 0:
+                if trend_ready:
+                    # SMA Context available
+                    current_sma = sma
+                    
+                    if DIP_ANCHOR_MODE == "SMA_ONLY":
+                        anchor_price = current_sma
+                    elif DIP_ANCHOR_MODE == "BLEND":
+                        w = DIP_BLEND_SMA_WEIGHT
+                        anchor_price = (Decimal(str(current_sma)) * Decimal(str(w))) + (Decimal(str(anchor_price)) * Decimal(str(1-w)))
+                        anchor_price = float(anchor_price)
+                    # Else LAST_SELL_ONLY (Keep default)
+
+                    # Falling Knife Guard
+                    if current_price < current_sma * (1 - MAX_UNDER_SMA_PCT):
+                         is_falling_knife = True
+
+                target_buy_price = anchor_price * (1 - BUY_DROP_PCT)
+                
+                # Debug Logging
+                if DIP_TARGET_DEBUG and (int(time.time()) % 15 == 0): # Log every ~15s
+                     pct_under = 0.0
+                     if trend_ready and sma > 0: pct_under = (sma - current_price) / sma
+                     logger.info(f"[DIP DEBUG] Price:{current_price:.2f} SMA:{sma:.2f} LastSell:{bot.last_sell_price:.2f} Anchor:{anchor_price:.2f} Target:{target_buy_price:.2f} UnderSMA:{pct_under*100:.2f}%")
+
+                if bot.last_sell_price > 0 or True: # Always check now, anchors handle init
                     # ONLY check logic if Dip Triggered
                     if current_price <= target_buy_price:
                         
+                        # 0. Falling Knife Guard
+                        if is_falling_knife:
+                             logger.info(f"BUY SKIPPED (Falling Knife: Price {current_price:.2f} < {MAX_UNDER_SMA_PCT*100}% below SMA)")
+                             time.sleep(LOOP_INTERVAL_SECONDS)
+                             continue
+
                         # 1. Check Trend Block Cooldown
                         if should_apply_trend_block(bot, time.time()):
                              logger.info(f"BUY SKIPPED (Trend cooldown active until {bot.trend_block_until:.0f})")
