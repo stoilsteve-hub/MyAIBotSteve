@@ -66,6 +66,17 @@ REVERSAL_SAMPLES = get_env("REVERSAL_SAMPLES", 3, int)
 TREND_BLOCK_COOLDOWN_SECONDS = get_env("TREND_BLOCK_COOLDOWN_SECONDS", 300, int)
 MIN_TREND_SPREAD_PCT = get_env("MIN_TREND_SPREAD_PCT", 0.0, float) # e.g. 0.001 for 0.1% buffer
 
+# Walk-The-Limit Config
+WALK_ENABLED = get_env("WALK_ENABLED", "YES") == "YES"
+WALK_SLICE_SECONDS = get_env("WALK_SLICE_SECONDS", 15, int)
+WALK_MAX_TOTAL_SECONDS = get_env("WALK_MAX_TOTAL_SECONDS", 180, int)
+WALK_MAX_ATTEMPTS = get_env("WALK_MAX_ATTEMPTS", 6, int)
+# Default offsets: Start = 0.1% (LIMIT_OFFSET_PCT), End = 0.0% (Mid)
+WALK_OFFSET_START_PCT = get_env("WALK_OFFSET_START_PCT", LIMIT_OFFSET_PCT, float)
+WALK_OFFSET_END_PCT = get_env("WALK_OFFSET_END_PCT", 0.0, float)
+WALK_MODE = get_env("WALK_MODE", "LINEAR") # LINEAR or EXPONENTIAL
+WALK_MAX_SPREAD_CROSS_PCT = get_env("WALK_MAX_SPREAD_CROSS_PCT", 0.0002, float) # 0.02% crossover cap
+
 # Reserve Watcher (Monitors NON-POT ETH)
 ENABLE_RESERVE_WATCHER = get_env("ENABLE_RESERVE_WATCHER", "YES") == "YES"
 ENABLE_RESERVE_AUTOSALE = get_env("ENABLE_RESERVE_AUTOSALE", "NO") == "YES"
@@ -754,10 +765,16 @@ def reserve_watcher(client, bot_state, current_mid, step_size_decimal, step_size
             logger.warning("RESERVE: Sell quantity too small for MinNotional. Skipping.")
             return
 
-        order = place_limit_order_with_timeout(
-            client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, 
-            tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
-        )
+        if WALK_ENABLED:
+            order = place_limit_order_walked(
+                 client, 'SELL', qty_to_sell, step_size_decimal, step_size_str,
+                 tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+            )
+        else:
+            order = place_limit_order_with_timeout(
+                client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, 
+                tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+            )
         
         if order:
             cumm_quote = float(order.get('cummulativeQuoteQty', 0.0))
@@ -783,6 +800,175 @@ def reserve_watcher(client, bot_state, current_mid, step_size_decimal, step_size
 # ==================================================================================
 # TRADING ACTIONS
 # ==================================================================================
+def place_limit_order_once_with_poll(client, side, qty_str, price_str, poll_seconds):
+    """
+    Helper for Walk Strategy: Places one limit order, polls it for `poll_seconds`.
+    Returns:
+      - Order Dict (if FILLED or Partially Filled)
+      - {"status": "CANCELED_TIMEOUT_NOFILL"} (if timed out and clean cancel)
+      - None (if API failure)
+    """
+    try:
+        # logger.info(f"WALK STEP: Placing {side} Order | Qty: {qty_str} | Price: {price_str} | Timeout: {poll_seconds}s")
+        
+        # 1. Place Order
+        order = api_call(
+            client.new_order,
+            symbol=SYMBOL,
+            side=side,
+            type="LIMIT",
+            timeInForce="GTC",
+            quantity=qty_str,
+            price=price_str
+        )
+        
+        order_id = order['orderId']
+        
+        # 2. Poll Loop
+        elapsed = 0
+        poll_interval = 2 # 2s polling
+        
+        while elapsed < poll_seconds:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            
+            try:
+                latest = api_call(client.get_order, symbol=SYMBOL, orderId=order_id)
+                status = latest['status']
+                
+                if status == 'FILLED':
+                    return latest
+                
+                if status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                    if float(latest['executedQty']) > 0:
+                        return latest
+                    else:
+                        return {"status": "CANCELED_TIMEOUT_NOFILL"}
+                        
+            except Exception as e:
+                logger.warning(f"WALK STEP Poll Error: {e}")
+                
+        # 3. Timeout Reached -> Cancel
+        logger.info(f"WALK STEP Timeout ({poll_seconds}s). Cancelling order {order_id}...")
+        try:
+            cancel_res = api_call(client.cancel_order, symbol=SYMBOL, orderId=order_id)
+            
+            if float(cancel_res.get('executedQty', 0)) > 0:
+                 return cancel_res
+            
+            return {"status": "CANCELED_TIMEOUT_NOFILL"}
+            
+        except ClientError as e:
+            if e.error_code == -2011: # Unknown order (already filled/canceled)
+                try:
+                    final = api_call(client.get_order, symbol=SYMBOL, orderId=order_id)
+                    if float(final['executedQty']) > 0:
+                        return final
+                    return {"status": "CANCELED_TIMEOUT_NOFILL"}
+                except:
+                    pass
+            logger.error(f"WALK STEP Cancel Failed: {e}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"WALK STEP Failed: {e}")
+        return None
+
+def place_limit_order_walked(client, side, qty_decimal, step_size_decimal, step_size_str, tick_size_decimal, mid_decimal, avg_price_cap_min=None, avg_price_cap_max=None):
+    """
+    Orchestrates a 'Walk-The-Limit' execution.
+    Attempts multiple limit orders starting passive, moving to aggressive.
+    """
+    start_time = time.time()
+    
+    # 1. Quantize Logic (Same as standard)
+    if step_size_decimal == 0:
+        final_qty = qty_decimal
+    else:
+        final_qty = (qty_decimal // step_size_decimal) * step_size_decimal
+        
+    qty_str = "{:f}".format(final_qty)
+    
+    logger.info(f"WALK START: {side} {qty_str} | MaxTime: {WALK_MAX_TOTAL_SECONDS}s | MaxAttempts: {WALK_MAX_ATTEMPTS}")
+    
+    for i in range(WALK_MAX_ATTEMPTS):
+        # Time Check
+        if time.time() - start_time > WALK_MAX_TOTAL_SECONDS:
+            logger.warning("WALK ENDED: Total time limit reached.")
+            break
+            
+        # Fresh Mid
+        current_mid, _ = get_mid_price_and_spread(client)
+        if current_mid == 0:
+            current_mid = float(mid_decimal) 
+            
+        # Linear Offset Calc
+        if WALK_MAX_ATTEMPTS > 1:
+            progress = i / (WALK_MAX_ATTEMPTS - 1)
+        else:
+            progress = 0.0
+            
+        current_offset_pct = WALK_OFFSET_START_PCT + (WALK_OFFSET_END_PCT - WALK_OFFSET_START_PCT) * progress
+        
+        # Calculate Price
+        mid_dec = Decimal(str(current_mid))
+        offset_dec = Decimal(str(current_offset_pct))
+        cross_cap_dec = Decimal(str(WALK_MAX_SPREAD_CROSS_PCT))
+        
+        if side == "BUY":
+            target_price = mid_dec * (Decimal("1.0") - offset_dec)
+            max_limit = mid_dec * (Decimal("1.0") + cross_cap_dec)
+            if target_price > max_limit: target_price = max_limit
+            
+            if avg_price_cap_max:
+                if target_price > avg_price_cap_max:
+                    target_price = avg_price_cap_max
+        else: # SELL
+            target_price = mid_dec * (Decimal("1.0") + offset_dec)
+            min_limit = mid_dec * (Decimal("1.0") - cross_cap_dec)
+            if target_price < min_limit: target_price = min_limit
+            
+            if avg_price_cap_min:
+                if target_price < avg_price_cap_min:
+                    target_price = avg_price_cap_min
+
+        # Round Price
+        def fmt_price(val, tick):
+            val = Decimal(str(val))
+            if tick <= 0: return "{:f}".format(val)
+            return "{:f}".format((val // tick) * tick)
+
+        price_str = fmt_price(target_price, tick_size_decimal)
+        
+        # Slice Time
+        remaining_total = WALK_MAX_TOTAL_SECONDS - (time.time() - start_time)
+        this_slice = min(WALK_SLICE_SECONDS, remaining_total)
+        if this_slice < 5: this_slice = 5
+        
+        logger.info(f"WALK STEP {i+1}/{WALK_MAX_ATTEMPTS}: {side} @ {price_str} (Off: {current_offset_pct*100:.3f}%). Mid: {current_mid:.2f}")
+        
+        res = place_limit_order_once_with_poll(client, side, qty_str, price_str, this_slice)
+        
+        if res:
+            status = res.get('status')
+            if status == "CANCELED_TIMEOUT_NOFILL":
+                continue # Retry next step
+            
+            # FILLED or Partial
+            if float(res.get('executedQty', 0)) > 0:
+                logger.info(f"WALK SUCCESS: Filled at step {i+1}")
+                return res
+            
+            # If CANCELED/REJECTED with 0 exec, it usually comes as status sentinel, 
+            # but if raw order dict returned with 0 exec, treat as retry?
+            # Our helper returns sentinel for clean 0-fill cancel. 
+            # So here we probably got a real fill or real error.
+            if status in ['CANCELED', 'EXPIRED'] and float(res.get('executedQty', 0)) == 0:
+                continue
+
+    logger.info("WALK ENDED: No fill after all attempts.")
+    return {"status": "CANCELED_TIMEOUT_NOFILL"}
+
 def place_limit_order_with_timeout(client, side, quantity_decimal, step_size_decimal, step_size_str, tick_size_decimal, estimated_price_decimal, avg_price_cap_min=None, avg_price_cap_max=None, timeout=ORDER_TIMEOUT_SECONDS):
     try:
         # 1. Quantize Quantity
@@ -955,7 +1141,10 @@ def fund_pot_if_needed(client, bot_state, target_notional, step_size_decimal, st
     f_price = next(f for f in filters if f['filterType'] == 'PRICE_FILTER')
     tick_size = Decimal(f_price['tickSize'])
     
-    order = place_limit_order_with_timeout(client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, tick_size, mid_decimal)
+    if WALK_ENABLED:
+        order = place_limit_order_walked(client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, tick_size, mid_decimal)
+    else:
+        order = place_limit_order_with_timeout(client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, tick_size, mid_decimal)
     
     if order and order.get("status") == "CANCELED_TIMEOUT_NOFILL":
         logger.info("FUNDING order timed out and canceled cleanly. Not counting as error.")
@@ -1311,10 +1500,16 @@ def main():
                             continue
 
                         # Execute LIMIT BUY
-                        order = place_limit_order_with_timeout(
-                            client, 'BUY', qty_to_buy, step_size_decimal, step_size_str, 
-                            tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
-                        )
+                        if WALK_ENABLED:
+                             order = place_limit_order_walked(
+                                 client, 'BUY', qty_to_buy, step_size_decimal, step_size_str,
+                                 tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+                             )
+                        else:
+                             order = place_limit_order_with_timeout(
+                                client, 'BUY', qty_to_buy, step_size_decimal, step_size_str, 
+                                tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+                            )
                         
                         if order and order.get('status') == 'CANCELED_TIMEOUT_NOFILL':
                             logger.info("BUY order timed out and canceled cleanly. Not counting as error.")
@@ -1401,10 +1596,16 @@ def main():
                          continue
                     
                     # Execute LIMIT SELL
-                    order = place_limit_order_with_timeout(
-                        client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, 
-                        tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
-                    )
+                    if WALK_ENABLED:
+                        order = place_limit_order_walked(
+                            client, 'SELL', qty_to_sell, step_size_decimal, step_size_str,
+                            tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+                        )
+                    else:
+                        order = place_limit_order_with_timeout(
+                            client, 'SELL', qty_to_sell, step_size_decimal, step_size_str, 
+                            tick_size_decimal, d_mid, avg_price_cap_min, avg_price_cap_max
+                        )
                     
                     if order and order.get('status') == 'CANCELED_TIMEOUT_NOFILL':
                         logger.info("SELL order timed out and canceled cleanly. Not counting as error.")
