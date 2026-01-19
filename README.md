@@ -66,7 +66,24 @@ The bot now dynamically detects the **Quote Asset** (e.g., EUR, USDT, BTC) based
      - Entry price
      - Trend history
      - Daily counters
+   - It remembers:
+     - Whether it’s holding ETH or EUR
+     - Entry price
+     - Trend history
+     - Daily counters
    - You can safely restart without confusing it.
+
+8. **Reserve ETH Watcher (Non-Pot Monitoring)**
+   - Monitors your *other* ETH (outside the bot's pot)
+   - Tracks total value in EUR/USDT (Value-based monitoring)
+   - Uses a High Watermark & Trailing Stop safety mechanism
+   - Can optionally auto-sell reserve ETH if value drops (Configurable)
+   - Logs a unified "Heartbeat" of both pot and reserve status
+
+9. **Dynamic Dip Anchor ("Golden Middle")**
+   - Instead of a static dip target, it uses a Blended Anchor (70% SMA + 30% Last Sell)
+   - Prevents targets from becoming stale during long drops
+   - Includes a "Falling Knife" guard to block buys if price crashes too far below SMA
 
 ### What the bot will NOT do (by design)
 
@@ -182,6 +199,25 @@ ORDER_TIMEOUT_SECONDS=60     # Wait 60s for order fill
 TREND_WINDOW_SAMPLES=60      # SMA window (60 * 15s = 15 mins)
 TREND_MIN_SAMPLES=30         # Samples needed to start trading
 MIN_FILL_QUOTE=5.0           # Minimum executed value (e.g. 5 EUR) to flip state (prevents dust state flips)
+
+# Option 2.1: Reversal Gate
+TREND_MODE=REVERSAL          # STRICT (Price > SMA) or REVERSAL (Price > SMA or Bounce)
+REVERSAL_MODE=BOUNCE3        # Confirm reversal if 3 samples are rising
+REVERSAL_SAMPLES=3           # Number of samples to check
+MIN_TREND_SPREAD_PCT=0.002   # 0.2% needed above SMA for crossover cross-check
+
+# Reserve Watcher (Non-Pot ETH)
+ENABLE_RESERVE_WATCHER=YES
+ENABLE_RESERVE_AUTOSALE=NO   # Set YES to enable auto-selling reserve ETH
+RESERVE_MIN_ETH=0.001        # Minimum ETH to monitor
+RESERVE_TRAIL_PCT=0.03       # 3% Trailing Stop (Value-based)
+RESERVE_TP_PCT=0.05          # 5% Take Profit (Value-based)
+
+# Dynamic Dip Anchor
+DIP_ANCHOR_MODE=BLEND        # BLEND (SMA+LastSell), SMA_ONLY, LAST_SELL_ONLY
+DIP_BLEND_SMA_WEIGHT=0.7     # 70% SMA, 30% LastSell
+MAX_UNDER_SMA_PCT=0.03       # Block buys if 3% below SMA (Falling Knife)
+DIP_TARGET_DEBUG=1           # Log detailed target calc
 ```
 
 ## Running the Bot
