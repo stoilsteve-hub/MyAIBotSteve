@@ -59,6 +59,13 @@ TREND_WINDOW_SAMPLES = get_env("TREND_WINDOW_SAMPLES", 60, int) # 60 * 15s = 15 
 TREND_MIN_SAMPLES = get_env("TREND_MIN_SAMPLES", 30, int) # Need 30 samples to start trading
 MIN_FILL_QUOTE = get_env("MIN_FILL_QUOTE", 5.0, float) # Min executed quote value to flip state
 
+# Option 2.1: Reversal Gate
+TREND_MODE = get_env("TREND_MODE", "REVERSAL") # STRICT or REVERSAL
+REVERSAL_MODE = get_env("REVERSAL_MODE", "BOUNCE3") # CROSSUP or BOUNCE3
+REVERSAL_SAMPLES = get_env("REVERSAL_SAMPLES", 3, int)
+TREND_BLOCK_COOLDOWN_SECONDS = get_env("TREND_BLOCK_COOLDOWN_SECONDS", 300, int)
+MIN_TREND_SPREAD_PCT = get_env("MIN_TREND_SPREAD_PCT", 0.0, float) # e.g. 0.001 for 0.1% buffer
+
 TIMEZONE_STR = get_env("TIMEZONE", "Europe/Stockholm")
 BASE_URL = get_env("BASE_URL", "https://api.binance.com")
 
@@ -93,7 +100,13 @@ class BotState:
         self.last_trade_time = 0
         self.last_trade_time = 0
         self.error_timestamps = []
+        self.error_timestamps = []
         self.price_history = [] # Now persistent
+        
+        # Option 2.1 Fields
+        self.trend_block_until = 0
+        self.last_sma = 0.0
+        self.last_mid = 0.0
 
     def load(self):
         if os.path.exists(STATE_FILE):
@@ -132,6 +145,11 @@ class BotState:
                     if len(ph) > TREND_WINDOW_SAMPLES:
                         ph = ph[-TREND_WINDOW_SAMPLES:]
                     self.price_history = ph
+                    
+                    # Option 2.1 State persistence
+                    self.trend_block_until = data.get("trend_block_until", 0)
+                    self.last_sma = data.get("last_sma", 0.0)
+                    self.last_mid = data.get("last_mid", 0.0)
                     
                     logger.info("State loaded successfully.")
             except Exception as e:
@@ -477,6 +495,64 @@ def calculate_sma(prices):
     if not prices: return 0.0
     return sum(prices) / len(prices)
 
+def should_apply_trend_block(bot_state, now_time):
+    if now_time < bot_state.trend_block_until:
+        return True
+    return False
+
+def set_trend_block(bot_state, now_time):
+    bot_state.trend_block_until = now_time + TREND_BLOCK_COOLDOWN_SECONDS
+    bot_state.save()
+
+def is_reversal_confirmed(price_history, current_price, current_sma, prev_price, prev_sma):
+    # Returns (bool, reason_string)
+    
+    # 1. Warmup Check (Should be handled by caller but safe to check)
+    if not price_history or len(price_history) < TREND_MIN_SAMPLES:
+        return False, "WARMUP"
+        
+    # 2. Strict Mode
+    if TREND_MODE == "STRICT":
+        # Price must be > SMA
+        required_price = current_sma * (1 + MIN_TREND_SPREAD_PCT)
+        if current_price > required_price:
+            return True, "STRICT_OK"
+        else:
+            return False, "STRICT_BLOCKED"
+            
+    # 3. Reversal Mode
+    if TREND_MODE == "REVERSAL":
+        if REVERSAL_MODE == "CROSSUP":
+            # Crossed above SMA from below?
+            # Or just currently above? Usually "CrossUp" implies event, but for gating "currently above" is safer?
+            # User Prompt: "Confirm only if: prev_price <= prev_sma AND current_price > current_sma"
+            # This is a strict crossover event.
+            req_curr = current_sma * (1 + MIN_TREND_SPREAD_PCT)
+            if prev_price <= prev_sma and current_price > req_curr:
+                return True, "REVERSAL_CROSSUP_OK"
+            return False, "REVERSAL_CROSSUP_BLOCKED"
+
+        elif REVERSAL_MODE == "BOUNCE3":
+            # Confirm if last N samples are rising
+            N = REVERSAL_SAMPLES
+            if len(price_history) < N:
+                 return False, "WARMUP_BOUNCE"
+            
+            # Check last N samples rising: p[-1] > p[-2] > ...
+            # price_history[-1] is current_price (if appended already? Yes, usually appended before check)
+            # Let's assume price_history[-1] is the LATEST
+            subset = price_history[-N:]
+            
+            # Check strictly increasing
+            is_rising = all(subset[i] < subset[i+1] for i in range(len(subset)-1))
+            
+            if is_rising:
+                return True, "REVERSAL_BOUNCE3_OK"
+            else:
+                return False, "REVERSAL_BOUNCE3_BLOCKED"
+                
+    return False, "UNKNOWN_MODE"
+
 # ==================================================================================
 # TRADING ACTIONS
 # ==================================================================================
@@ -801,18 +877,31 @@ def main():
             avg_price_cap_max = Decimal(str(current_price)) * mul_up
             avg_price_cap_min = Decimal(str(current_price)) * mul_down
 
+            # 4. Market Data
+            current_price, spread = get_mid_price_and_spread(client)
+            if current_price == 0:
+                time.sleep(5)
+                continue
+            
+            # 4b. Percent Price Limits (Clamp Calculation)
+            avg_price_cap_max = Decimal(str(current_price)) * mul_up
+            avg_price_cap_min = Decimal(str(current_price)) * mul_down
+
             # 4c. Trend Data Collection & Persistence
+            # Store previous values for CrossUp logic
+            prev_price = bot.price_history[-1] if bot.price_history else current_price
+            prev_sma = calculate_sma(bot.price_history) # SMA before new price
+            
             bot.price_history.append(current_price)
             if len(bot.price_history) > TREND_WINDOW_SAMPLES:
                  bot.price_history.pop(0) 
-            # Persist trend data every loop? Optimization: Only save every N loops or if trade happens?
-            # User requirement: "Persist trend data safely". Safest is save every loop or periodically.
-            # To avoid excessive IO, maybe only save if list changed size significantly? 
-            # Or just rely on OS buffer. Let's do save every loop for strict safety as requested.
+            
+            # Option 2.1: Save last mid/sma for context
+            bot.last_mid = current_price
+            sma = calculate_sma(bot.price_history)
+            bot.last_sma = sma
             bot.save()
             
-            # SMA
-            sma = calculate_sma(bot.price_history)
             trend_ready = len(bot.price_history) >= TREND_MIN_SAMPLES
             
             # Spread Check
@@ -824,7 +913,12 @@ def main():
             if not trend_ready:
                  logger.info(f"Collecting trend data... ({len(bot.price_history)}/{TREND_MIN_SAMPLES})")
             else:
-                 logger.info(f"State: {bot.state} | Price: {current_price:.2f} | SMA: {sma:.2f} | Pot: {bot.pot_quote:.2f} {QUOTE_ASSET} / {bot.pot_eth:.4f} ETH")
+                 # Enhanced Logging
+                 if bot.state == "HOLDING_QUOTE":
+                      disp_target = bot.last_sell_price * (1 - BUY_DROP_PCT)
+                      logger.info(f"State: {bot.state} | Price: {current_price:.2f} | SMA: {sma:.2f} | DipTarget: {disp_target:.2f} | Pot: {bot.pot_quote:.2f} {QUOTE_ASSET}")
+                 else:
+                      logger.info(f"State: {bot.state} | Price: {current_price:.2f} | SMA: {sma:.2f} | Pot: {bot.pot_eth:.4f} ETH")
 
             # 5. Logic
             if bot.state == "HOLDING_QUOTE":
@@ -832,18 +926,31 @@ def main():
                 target_buy_price = bot.last_sell_price * (1 - BUY_DROP_PCT)
                 
                 if bot.last_sell_price > 0:
+                    # ONLY check logic if Dip Triggered
                     if current_price <= target_buy_price:
-                        # TREND FILTER
-                        if not trend_ready:
-                             time.sleep(LOOP_INTERVAL_SECONDS)
-                             continue
                         
-                        if current_price <= sma:
-                             logger.info(f"SIGNAL: BUY SKIPPED (Trend Filter: Price {current_price:.2f} < SMA {sma:.2f})")
+                        # 1. Check Trend Block Cooldown
+                        if should_apply_trend_block(bot, time.time()):
+                             logger.info(f"BUY SKIPPED (Trend cooldown active until {bot.trend_block_until:.0f})")
                              time.sleep(LOOP_INTERVAL_SECONDS)
                              continue
 
-                        logger.info(f"SIGNAL: BUY (Price {current_price:.2f} < Target {target_buy_price:.2f} AND > SMA)")
+                        # 2. Check Warmup
+                        if not trend_ready:
+                             logger.info(f"BUY SKIPPED (Trend warmup {len(bot.price_history)}/{TREND_MIN_SAMPLES})")
+                             time.sleep(LOOP_INTERVAL_SECONDS)
+                             continue
+                        
+                        # 3. Reversal Gate
+                        is_ok, reason = is_reversal_confirmed(bot.price_history, current_price, sma, prev_price, prev_sma)
+                        
+                        if not is_ok:
+                             logger.info(f"BUY SKIPPED (Trend Gate: {reason} | Price {current_price:.2f} | SMA {sma:.2f})")
+                             set_trend_block(bot, time.time())
+                             time.sleep(LOOP_INTERVAL_SECONDS)
+                             continue
+
+                        logger.info(f"BUY APPROVED ({reason} | Price {current_price:.2f} | SMA {sma:.2f} | DipTarget {target_buy_price:.2f})")
                         
                         # Calculate Qty
                         qty_raw = Decimal(str(bot.pot_quote)) / Decimal(str(current_price))
